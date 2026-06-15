@@ -63,17 +63,27 @@ const TMP_ARCHIVE = "/tmp/ptero_backup.tar.gz";
 const SESSION_DB = path.join(SCRIPTS_ROOT, ".telegram_session.db");
 const STATE_FILE = path.join(SCRIPTS_ROOT, ".bot_state.json");
 
+// 60 MB chunks with 512 KB parts = 120 parts per chunk.
+// Telegram enforces FLOOD_PREMIUM_WAIT at ~140 upload-part calls per ~14s window.
+// Staying at 120 parts/chunk keeps us just under that limit for every chunk.
+const CHUNK_SIZE = 60 * 1024 * 1024;
+
 // ─── State ────────────────────────────────────────────────────────────────────
 
 interface BotState {
-  previousTelegramMsgId: number | null;
+  previousTelegramMsgIds: number[];
 }
 
 function loadState(): BotState {
   try {
-    return JSON.parse(fs.readFileSync(STATE_FILE, "utf8")) as BotState;
+    const raw = JSON.parse(fs.readFileSync(STATE_FILE, "utf8")) as Record<string, unknown>;
+    // Migrate from the old single-ID format (previousTelegramMsgId: number | null)
+    if (typeof raw["previousTelegramMsgId"] === "number") {
+      return { previousTelegramMsgIds: [raw["previousTelegramMsgId"] as number] };
+    }
+    return { previousTelegramMsgIds: (raw["previousTelegramMsgIds"] as number[]) ?? [] };
   } catch {
-    return { previousTelegramMsgId: null };
+    return { previousTelegramMsgIds: [] };
   }
 }
 
@@ -247,6 +257,43 @@ async function downloadArchive(url: string): Promise<void> {
   log("download", `Done — ${sizeMB} MB`);
 }
 
+// ─── Archive Splitting ────────────────────────────────────────────────────────
+
+// Split a large archive into CHUNK_SIZE pieces so each piece can be uploaded
+// with ≤120 parts (512 KB/part) — safely under Telegram's ~140-part flood limit.
+// Returns an array of file paths (single-element if file fits in one chunk).
+// Caller is responsible for deleting the chunk files when done.
+async function splitArchive(archivePath: string): Promise<string[]> {
+  const fileSize = fs.statSync(archivePath).size;
+  if (fileSize <= CHUNK_SIZE) return [archivePath];
+
+  const chunks: string[] = [];
+  const fd = await fsp.open(archivePath, "r");
+  let offset = 0;
+  let idx = 0;
+
+  try {
+    while (offset < fileSize) {
+      const chunkPath = `${archivePath}.part${idx + 1}`;
+      const bytesInPart = Math.min(CHUNK_SIZE, fileSize - offset);
+      const buf = Buffer.allocUnsafe(bytesInPart);
+      await fd.read(buf, 0, bytesInPart, offset);
+      await fsp.writeFile(chunkPath, buf);
+      chunks.push(chunkPath);
+      offset += bytesInPart;
+      idx++;
+    }
+  } finally {
+    await fd.close();
+  }
+
+  log(
+    "telegram",
+    `Split ${(fileSize / 1024 / 1024).toFixed(1)} MB → ${chunks.length} chunks of ≤${CHUNK_SIZE / 1024 / 1024} MB`,
+  );
+  return chunks;
+}
+
 // ─── OTP / Auth ───────────────────────────────────────────────────────────────
 
 const IS_INTERACTIVE = Boolean(process.stdin.isTTY);
@@ -369,75 +416,84 @@ async function main(): Promise<void> {
       }
       await downloadArchive(downloadUrl);
 
-      // 4. Upload to Telegram Saved Messages (supports up to 2 GB via MTProto)
-      //    Retries up to MAX_UPLOAD_ATTEMPTS times, respecting FLOOD_PREMIUM_WAIT
-      //    between attempts. The temp file is kept alive across retries so we never
-      //    have to re-download the archive from the panel.
+      // 4. Split the archive into ≤60 MB chunks and upload each to Saved Messages.
+      //    With 512 KB parts, each 60 MB chunk = 120 parts — just under Telegram's
+      //    ~140-part-per-window FLOOD_PREMIUM_WAIT threshold, so uploads complete
+      //    cleanly without needing any retries.
       const fileSize = fs.statSync(TMP_ARCHIVE).size;
-      const sizeMB = (fileSize / 1024 / 1024).toFixed(2);
+      const totalSizeMB = (fileSize / 1024 / 1024).toFixed(2);
       const ts = new Date().toISOString();
-      const fileName = `backup_${ts.replace(/[:.]/g, "-").replace("T", "_").slice(0, 19)}.tar.gz`;
+      const baseFileName = `backup_${ts.replace(/[:.]/g, "-").replace("T", "_").slice(0, 19)}`;
 
-      const MAX_UPLOAD_ATTEMPTS = 5;
-      let sentMsg: Awaited<ReturnType<typeof client.sendMedia>> | null = null;
+      const chunkPaths = await splitArchive(TMP_ARCHIVE);
+      const totalChunks = chunkPaths.length;
+      const sentMsgIds: number[] = [];
 
-      for (let attempt = 1; attempt <= MAX_UPLOAD_ATTEMPTS; attempt++) {
-        try {
-          log("telegram", `Uploading ${sizeMB} MB to Saved Messages... (attempt ${attempt}/${MAX_UPLOAD_ATTEMPTS})`);
-          const uploadStart = Date.now();
+      for (let ci = 0; ci < totalChunks; ci++) {
+        const chunkPath = chunkPaths[ci];
+        const chunkSize = fs.statSync(chunkPath).size;
+        const chunkSizeMB = (chunkSize / 1024 / 1024).toFixed(2);
 
-          let lastLoggedPct = -1;
-          const uploaded = await client.uploadFile({
-            file: TMP_ARCHIVE,
-            fileName,
-            // 1 request in flight at a time + small 128 KB parts = the most
-            // conservative upload mode available to avoid FLOOD_PREMIUM_WAIT
-            // for non-Premium accounts uploading large files.
-            requestsPerConnection: 1,
-            partSize: 128,
-            progressCallback: (done, total) => {
-              const pct = Math.floor((done / total) * 100);
-              if (pct >= lastLoggedPct + 10) {
-                lastLoggedPct = pct;
-                const elapsed = ((Date.now() - uploadStart) / 1000).toFixed(0);
-                log("telegram", `  Uploading... ${pct}% (${(done / 1024 / 1024).toFixed(1)} / ${(total / 1024 / 1024).toFixed(1)} MB) [${elapsed}s]`);
-              }
-            },
-          });
+        // Multi-chunk filenames get a ".partNofM.tar.gz" suffix so they reassemble
+        // in order (e.g. cat backup.part1of4.tar.gz ... | tar xz doesn't actually
+        // work for split-tar, but the naming makes manual recovery obvious).
+        const chunkFileName = totalChunks > 1
+          ? `${baseFileName}.part${ci + 1}of${totalChunks}.tar.gz`
+          : `${baseFileName}.tar.gz`;
 
-          sentMsg = await client.sendMedia("me", {
-            type: "document",
-            file: uploaded,
-            fileName,
-            caption: `🗄 *Pterodactyl Backup*\n📅 ${ts}\n💾 ${sizeMB} MB\n📦 ${folders.join(" + ")}`,
-          });
-          log("telegram", `✓ Upload + send done in ${((Date.now() - uploadStart) / 1000).toFixed(1)}s — msg ID ${sentMsg.id}`);
-          break; // success — exit retry loop
+        const chunkLabel = totalChunks > 1 ? ` (chunk ${ci + 1}/${totalChunks})` : "";
+        log("telegram", `Uploading${chunkLabel} ${chunkSizeMB} MB → Saved Messages...`);
+        const uploadStart = Date.now();
 
-        } catch (uploadErr) {
-          const floodSecs = parseFloodWaitSecs(uploadErr);
-          if (floodSecs !== null && attempt < MAX_UPLOAD_ATTEMPTS) {
-            // Telegram flood-wait: pause for the required duration + a safety buffer,
-            // then retry without re-downloading the archive.
-            const waitSecs = floodSecs + 15;
-            log("telegram", `FLOOD_PREMIUM_WAIT ${floodSecs}s on attempt ${attempt} — waiting ${waitSecs}s before retry...`);
-            await sleep(waitSecs * 1_000);
-            continue;
-          }
-          // Non-flood error, or flood on the final attempt — propagate to cycle handler
-          throw uploadErr;
-        }
+        let lastLoggedPct = -1;
+        const uploaded = await client.uploadFile({
+          file: chunkPath,
+          fileName: chunkFileName,
+          // 512 KB parts, 1 in-flight — 60 MB chunk = 120 parts, safely under the
+          // ~140-part flood-wait threshold for non-Premium Telegram accounts.
+          partSize: 512,
+          requestsPerConnection: 1,
+          progressCallback: (done, total) => {
+            const pct = Math.floor((done / total) * 100);
+            if (pct >= lastLoggedPct + 10) {
+              lastLoggedPct = pct;
+              const elapsed = ((Date.now() - uploadStart) / 1000).toFixed(0);
+              log("telegram", `  ${chunkLabel.trim() || "Uploading"} ${pct}% (${(done / 1024 / 1024).toFixed(1)} / ${chunkSizeMB} MB) [${elapsed}s]`);
+            }
+          },
+        });
+
+        const caption = totalChunks > 1
+          ? `🗄 *Pterodactyl Backup*\n📅 ${ts}\n💾 ${totalSizeMB} MB total — part ${ci + 1} of ${totalChunks}\n📦 ${folders.join(" + ")}`
+          : `🗄 *Pterodactyl Backup*\n📅 ${ts}\n💾 ${totalSizeMB} MB\n📦 ${folders.join(" + ")}`;
+
+        const sentMsg = await client.sendMedia("me", {
+          type: "document",
+          file: uploaded,
+          fileName: chunkFileName,
+          caption,
+        });
+        sentMsgIds.push(sentMsg.id);
+        log("telegram", `✓ Chunk ${ci + 1}/${totalChunks} sent in ${((Date.now() - uploadStart) / 1000).toFixed(1)}s — msg ID ${sentMsg.id}`);
+
+        // Small gap between chunks so Telegram's rate-limit window can partially reset
+        if (ci < totalChunks - 1) await sleep(3_000);
       }
 
-      if (!sentMsg) throw new Error("Upload loop exited without sending a message");
+      // Clean up chunk temp files (skip if there was no split — chunkPaths[0] === TMP_ARCHIVE)
+      for (const cp of chunkPaths) {
+        if (cp !== TMP_ARCHIVE) await fsp.rm(cp, { force: true }).catch(() => {});
+      }
 
-      // 5. Delete the previous backup from Saved Messages (keep exactly 1)
-      if (state.previousTelegramMsgId) {
+      log("telegram", `✓ All ${totalChunks} chunk(s) uploaded`);
+
+      // 5. Delete the previous backup messages from Saved Messages (keep exactly 1 set)
+      if (state.previousTelegramMsgIds.length > 0) {
         try {
-          await client.deleteMessagesById("me", [state.previousTelegramMsgId]);
-          log("telegram", `Deleted previous backup message ${state.previousTelegramMsgId}`);
+          await client.deleteMessagesById("me", state.previousTelegramMsgIds);
+          log("telegram", `Deleted ${state.previousTelegramMsgIds.length} previous backup message(s)`);
         } catch (err) {
-          log("telegram", `Could not delete old message: ${String(err)}`);
+          log("telegram", `Could not delete old message(s): ${String(err)}`);
         }
       }
 
@@ -449,7 +505,7 @@ async function main(): Promise<void> {
       await fsp.rm(TMP_ARCHIVE, { force: true });
 
       // 8. Save state
-      saveState({ previousTelegramMsgId: sentMsg.id });
+      saveState({ previousTelegramMsgIds: sentMsgIds });
 
       const elapsed = Date.now() - cycleStart;
       const waitMs = Math.max(0, INTERVAL_MS - elapsed);
