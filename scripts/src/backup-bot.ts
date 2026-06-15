@@ -63,11 +63,6 @@ const TMP_ARCHIVE = "/tmp/ptero_backup.tar.gz";
 const SESSION_DB = path.join(SCRIPTS_ROOT, ".telegram_session.db");
 const STATE_FILE = path.join(SCRIPTS_ROOT, ".bot_state.json");
 
-// 60 MB chunks with 512 KB parts = 120 parts per chunk.
-// Telegram enforces FLOOD_PREMIUM_WAIT at ~140 upload-part calls per ~14s window.
-// Staying at 120 parts/chunk keeps us just under that limit for every chunk.
-const CHUNK_SIZE = 60 * 1024 * 1024;
-
 // ─── State ────────────────────────────────────────────────────────────────────
 
 interface BotState {
@@ -257,41 +252,89 @@ async function downloadArchive(url: string): Promise<void> {
   log("download", `Done — ${sizeMB} MB`);
 }
 
-// ─── Archive Splitting ────────────────────────────────────────────────────────
+// ─── Resumable Part-Level Upload ─────────────────────────────────────────────
+//
+// Telegram's FLOOD_PREMIUM_WAIT throttles non-Premium upload speed.  The built-in
+// client.uploadFile() restarts from part 0 on every error, so it can never make
+// forward progress once flood-waits start hitting regularly.
+//
+// This function sends 512 KB parts one-by-one using the raw upload.saveBigFilePart
+// TL call.  When FLOOD_PREMIUM_WAIT hits any part, we wait the required seconds and
+// retry THAT SAME PART — so each retry moves the upload forward instead of backward.
 
-// Split a large archive into CHUNK_SIZE pieces so each piece can be uploaded
-// with ≤120 parts (512 KB/part) — safely under Telegram's ~140-part flood limit.
-// Returns an array of file paths (single-element if file fits in one chunk).
-// Caller is responsible for deleting the chunk files when done.
-async function splitArchive(archivePath: string): Promise<string[]> {
-  const fileSize = fs.statSync(archivePath).size;
-  if (fileSize <= CHUNK_SIZE) return [archivePath];
+const UPLOAD_PART_SIZE = 512 * 1024; // 512 KB — maximum allowed by Telegram
 
-  const chunks: string[] = [];
-  const fd = await fsp.open(archivePath, "r");
-  let offset = 0;
-  let idx = 0;
+async function uploadFileResumable(
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  client: any,
+  filePath: string,
+  fileName: string,
+  onProgress: (done: number, total: number) => void,
+): Promise<{ inputFile: { _: string; id: bigint; parts: number; name: string }; size: number; mime: string }> {
+  const fileSize = fs.statSync(filePath).size;
+  const totalParts = Math.ceil(fileSize / UPLOAD_PART_SIZE);
+
+  // Random 64-bit file ID (Telegram requires a unique bigint per upload)
+  const fileId =
+    BigInt(Math.floor(Math.random() * 0x7fffffff)) * BigInt(0x100000000) +
+    BigInt(Math.floor(Math.random() * 0xffffffff));
+
+  log("telegram", `Resumable upload: ${totalParts} × 512 KB parts (flood waits auto-handled per-part)`);
+
+  const fd = await fsp.open(filePath, "r");
+  let bytesUploaded = 0;
 
   try {
-    while (offset < fileSize) {
-      const chunkPath = `${archivePath}.part${idx + 1}`;
-      const bytesInPart = Math.min(CHUNK_SIZE, fileSize - offset);
+    for (let partIdx = 0; partIdx < totalParts; partIdx++) {
+      const offset = partIdx * UPLOAD_PART_SIZE;
+      const bytesInPart = Math.min(UPLOAD_PART_SIZE, fileSize - offset);
       const buf = Buffer.allocUnsafe(bytesInPart);
       await fd.read(buf, 0, bytesInPart, offset);
-      await fsp.writeFile(chunkPath, buf);
-      chunks.push(chunkPath);
-      offset += bytesInPart;
-      idx++;
+
+      // Retry this single part on flood waits — never resets to part 0.
+      while (true) {
+        try {
+          const ok = await client.call(
+            {
+              _: "upload.saveBigFilePart",
+              fileId,
+              filePart: partIdx,
+              fileTotalParts: totalParts,
+              bytes: buf,
+            },
+            { kind: "upload" },
+          );
+          if (!ok) throw new Error(`Server rejected part ${partIdx}`);
+          break;
+        } catch (partErr) {
+          const floodSecs = parseFloodWaitSecs(partErr);
+          if (floodSecs !== null) {
+            const pct = Math.floor((partIdx / totalParts) * 100);
+            const waitSecs = floodSecs + 5;
+            log(
+              "telegram",
+              `  Part ${partIdx + 1}/${totalParts} (${pct}%) — FLOOD_WAIT ${floodSecs}s → resuming in ${waitSecs}s`,
+            );
+            await sleep(waitSecs * 1_000);
+            // loop → retry exact same part
+          } else {
+            throw partErr;
+          }
+        }
+      }
+
+      bytesUploaded += bytesInPart;
+      onProgress(bytesUploaded, fileSize);
     }
   } finally {
     await fd.close();
   }
 
-  log(
-    "telegram",
-    `Split ${(fileSize / 1024 / 1024).toFixed(1)} MB → ${chunks.length} chunks of ≤${CHUNK_SIZE / 1024 / 1024} MB`,
-  );
-  return chunks;
+  return {
+    inputFile: { _: "inputFileBig", id: fileId, parts: totalParts, name: fileName },
+    size: fileSize,
+    mime: "application/gzip",
+  };
 }
 
 // ─── OTP / Auth ───────────────────────────────────────────────────────────────
@@ -416,76 +459,36 @@ async function main(): Promise<void> {
       }
       await downloadArchive(downloadUrl);
 
-      // 4. Split the archive into ≤60 MB chunks and upload each to Saved Messages.
-      //    With 512 KB parts, each 60 MB chunk = 120 parts — just under Telegram's
-      //    ~140-part-per-window FLOOD_PREMIUM_WAIT threshold, so uploads complete
-      //    cleanly without needing any retries.
+      // 4. Upload to Telegram Saved Messages using resumable part-level upload.
+      //    FLOOD_PREMIUM_WAIT is handled per-part — each flood wait pauses and
+      //    retries the exact same part, so the upload always moves forward.
       const fileSize = fs.statSync(TMP_ARCHIVE).size;
       const totalSizeMB = (fileSize / 1024 / 1024).toFixed(2);
       const ts = new Date().toISOString();
-      const baseFileName = `backup_${ts.replace(/[:.]/g, "-").replace("T", "_").slice(0, 19)}`;
+      const fileName = `backup_${ts.replace(/[:.]/g, "-").replace("T", "_").slice(0, 19)}.tar.gz`;
 
-      const chunkPaths = await splitArchive(TMP_ARCHIVE);
-      const totalChunks = chunkPaths.length;
-      const sentMsgIds: number[] = [];
+      log("telegram", `Uploading ${totalSizeMB} MB to Saved Messages...`);
+      const uploadStart = Date.now();
+      let lastLoggedPct = -1;
 
-      for (let ci = 0; ci < totalChunks; ci++) {
-        const chunkPath = chunkPaths[ci];
-        const chunkSize = fs.statSync(chunkPath).size;
-        const chunkSizeMB = (chunkSize / 1024 / 1024).toFixed(2);
+      const uploaded = await uploadFileResumable(client, TMP_ARCHIVE, fileName, (done, total) => {
+        const pct = Math.floor((done / total) * 100);
+        if (pct >= lastLoggedPct + 10) {
+          lastLoggedPct = pct;
+          const elapsed = ((Date.now() - uploadStart) / 1000).toFixed(0);
+          log("telegram", `  Upload ${pct}% (${(done / 1024 / 1024).toFixed(1)} / ${totalSizeMB} MB) [${elapsed}s]`);
+        }
+      });
 
-        // Multi-chunk filenames get a ".partNofM.tar.gz" suffix so they reassemble
-        // in order (e.g. cat backup.part1of4.tar.gz ... | tar xz doesn't actually
-        // work for split-tar, but the naming makes manual recovery obvious).
-        const chunkFileName = totalChunks > 1
-          ? `${baseFileName}.part${ci + 1}of${totalChunks}.tar.gz`
-          : `${baseFileName}.tar.gz`;
-
-        const chunkLabel = totalChunks > 1 ? ` (chunk ${ci + 1}/${totalChunks})` : "";
-        log("telegram", `Uploading${chunkLabel} ${chunkSizeMB} MB → Saved Messages...`);
-        const uploadStart = Date.now();
-
-        let lastLoggedPct = -1;
-        const uploaded = await client.uploadFile({
-          file: chunkPath,
-          fileName: chunkFileName,
-          // 512 KB parts, 1 in-flight — 60 MB chunk = 120 parts, safely under the
-          // ~140-part flood-wait threshold for non-Premium Telegram accounts.
-          partSize: 512,
-          requestsPerConnection: 1,
-          progressCallback: (done, total) => {
-            const pct = Math.floor((done / total) * 100);
-            if (pct >= lastLoggedPct + 10) {
-              lastLoggedPct = pct;
-              const elapsed = ((Date.now() - uploadStart) / 1000).toFixed(0);
-              log("telegram", `  ${chunkLabel.trim() || "Uploading"} ${pct}% (${(done / 1024 / 1024).toFixed(1)} / ${chunkSizeMB} MB) [${elapsed}s]`);
-            }
-          },
-        });
-
-        const caption = totalChunks > 1
-          ? `🗄 *Pterodactyl Backup*\n📅 ${ts}\n💾 ${totalSizeMB} MB total — part ${ci + 1} of ${totalChunks}\n📦 ${folders.join(" + ")}`
-          : `🗄 *Pterodactyl Backup*\n📅 ${ts}\n💾 ${totalSizeMB} MB\n📦 ${folders.join(" + ")}`;
-
-        const sentMsg = await client.sendMedia("me", {
-          type: "document",
-          file: uploaded,
-          fileName: chunkFileName,
-          caption,
-        });
-        sentMsgIds.push(sentMsg.id);
-        log("telegram", `✓ Chunk ${ci + 1}/${totalChunks} sent in ${((Date.now() - uploadStart) / 1000).toFixed(1)}s — msg ID ${sentMsg.id}`);
-
-        // Small gap between chunks so Telegram's rate-limit window can partially reset
-        if (ci < totalChunks - 1) await sleep(3_000);
-      }
-
-      // Clean up chunk temp files (skip if there was no split — chunkPaths[0] === TMP_ARCHIVE)
-      for (const cp of chunkPaths) {
-        if (cp !== TMP_ARCHIVE) await fsp.rm(cp, { force: true }).catch(() => {});
-      }
-
-      log("telegram", `✓ All ${totalChunks} chunk(s) uploaded`);
+      const sentMsg = await client.sendMedia("me", {
+        type: "document",
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        file: uploaded as any,
+        fileName,
+        caption: `🗄 *Pterodactyl Backup*\n📅 ${ts}\n💾 ${totalSizeMB} MB\n📦 ${folders.join(" + ")}`,
+      });
+      const sentMsgIds = [sentMsg.id];
+      log("telegram", `✓ Upload done in ${((Date.now() - uploadStart) / 1000).toFixed(1)}s — msg ID ${sentMsg.id}`);
 
       // 5. Delete the previous backup messages from Saved Messages (keep exactly 1 set)
       if (state.previousTelegramMsgIds.length > 0) {
