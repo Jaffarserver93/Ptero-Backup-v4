@@ -9,6 +9,9 @@ import { setTimeout as sleep } from "timers/promises";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SCRIPTS_ROOT = path.join(__dirname, "..");
 
+// mtcute creates many AbortSignal listeners during parallel uploads — raise the limit
+process.setMaxListeners(50);
+
 // ─── Load .env file if present (for terminal / start.sh runs) ─────────────────
 try {
   const envPath = path.join(SCRIPTS_ROOT, ".env");
@@ -428,19 +431,19 @@ async function main(): Promise<void> {
         await fsp.rm(TMP_ARCHIVE, { force: true }).catch(() => {});
       }
 
-      // Respect Telegram flood-wait — parse the required wait from the error
+      // Always wait out the remainder of the full 5-minute interval before retrying.
+      // For Telegram flood-wait errors, also enforce the required minimum wait.
       const floodSecs = parseFloodWaitSecs(err);
+      const elapsed = Date.now() - cycleStart;
+      let waitMs = Math.max(30_000, INTERVAL_MS - elapsed);
       if (floodSecs !== null) {
-        const waitSec = floodSecs + 10; // add a small buffer
-        log("telegram", `Flood wait — sleeping ${waitSec}s before next cycle`);
-        await sleep(waitSec * 1_000);
+        const floodMs = (floodSecs + 10) * 1_000;
+        waitMs = Math.max(waitMs, floodMs);
+        log("telegram", `Flood wait ${floodSecs}s — next cycle in ${Math.ceil(waitMs / 1000)}s`);
       } else {
-        // Default: wait out the rest of the 5-minute interval before retrying
-        const elapsed = Date.now() - cycleStart;
-        const waitMs = Math.max(30_000, INTERVAL_MS - elapsed);
         log("bot", `Retrying in ${Math.ceil(waitMs / 1000)}s`);
-        await sleep(waitMs);
       }
+      await sleep(waitMs);
     }
   }
 }
