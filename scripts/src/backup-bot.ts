@@ -241,21 +241,42 @@ async function main(): Promise<void> {
       const downloadUrl = await getDownloadLink(archiveName);
       await downloadArchive(downloadUrl);
 
-      // 3. Upload to Telegram Saved Messages
-      const sizeMB = (fs.statSync(TMP_ARCHIVE).size / 1024 / 1024).toFixed(2);
+      // 3. Upload to Telegram Saved Messages (supports up to 2 GB via MTProto)
+      const fileSize = fs.statSync(TMP_ARCHIVE).size;
+      const sizeMB = (fileSize / 1024 / 1024).toFixed(2);
       const ts = new Date().toISOString();
-      log("telegram", `Uploading ${sizeMB} MB to Saved Messages...`);
+      const fileName = `worlds_plugins_${ts.replace(/[:.]/g, "-").replace("T", "_").slice(0, 19)}.tar.gz`;
 
+      log("telegram", `Uploading ${sizeMB} MB to Saved Messages...`);
       const uploadStart = Date.now();
+
+      // Upload the file with live progress logging
+      let lastLoggedPct = -1;
+      const uploaded = await client.uploadFile({
+        file: TMP_ARCHIVE,
+        fileName,
+        progressCallback: (done, total) => {
+          const pct = Math.floor((done / total) * 100);
+          // Log every 10%
+          if (pct >= lastLoggedPct + 10) {
+            lastLoggedPct = pct;
+            const elapsed = ((Date.now() - uploadStart) / 1000).toFixed(0);
+            log("telegram", `  Uploading... ${pct}% (${(done / 1024 / 1024).toFixed(1)} / ${(total / 1024 / 1024).toFixed(1)} MB) [${elapsed}s]`);
+          }
+        },
+      });
+
+      // Send the already-uploaded file to Saved Messages
       const sentMsg = await client.sendMedia("me", {
         type: "document",
-        file: TMP_ARCHIVE,
-        fileName: `worlds_plugins_${ts.replace(/[:.]/g, "-").replace("T", "_").slice(0, 19)}.tar.gz`,
+        file: uploaded,
+        fileName,
         caption: `🗄 *Pterodactyl Backup*\n📅 ${ts}\n💾 ${sizeMB} MB\n📦 worlds + plugins`,
       });
-      log("telegram", `Upload done in ${((Date.now() - uploadStart) / 1000).toFixed(1)}s — msg ID ${sentMsg.id}`);
+      log("telegram", `✓ Upload + send done in ${((Date.now() - uploadStart) / 1000).toFixed(1)}s — msg ID ${sentMsg.id}`);
 
-      // 4. Delete previous Telegram backup message (keep Saved Messages clean)
+      // 4. New backup is safely in Saved Messages — NOW delete the previous one
+      //    This ensures there is always exactly 1 backup in Saved Messages
       if (state.previousTelegramMsgId) {
         try {
           await client.deleteMessagesById("me", [state.previousTelegramMsgId]);
