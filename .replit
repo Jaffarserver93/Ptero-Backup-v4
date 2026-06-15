@@ -18,15 +18,15 @@ author = "agent"
 
 [[workflows.workflow.tasks]]
 task = "workflow.run"
-args = "Pterodactyl Backup (every 6h)"
+args = "Pterodactyl Backup Bot"
 
 [[workflows.workflow]]
-name = "Pterodactyl Backup (every 6h)"
+name = "Pterodactyl Backup Bot"
 author = "agent"
 
 [[workflows.workflow.tasks]]
 task = "shell.exec"
-args = "while true; do pnpm --filter @workspace/scripts run backup; sleep 21600; done"
+args = "pnpm --filter @workspace/scripts run backup-bot"
 
 [workflows.workflow.metadata]
 outputType = "console"

@@ -6,6 +6,7 @@
   "scripts": {
     "hello": "tsx ./src/hello.ts",
     "backup": "tsx ./src/backup.ts",
+    "backup-bot": "tsx ./src/backup-bot.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "devDependencies": {
@@ -13,7 +14,10 @@
     "tsx": "catalog:"
   },
   "dependencies": {
+    "@mtcute/dispatcher": "^0.30.1",
+    "@mtcute/node": "^0.30.1",
     "axios": "^1.18.0",
+    "mtproto-core": "^6.3.0",
     "node-telegram-bot-api": "^1.1.0"
   }
 }
