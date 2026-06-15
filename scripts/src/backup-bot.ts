@@ -486,6 +486,12 @@ async function main(): Promise<void> {
   }
 }
 
+// Write to stdout immediately at module load time.
+// This fires BEFORE main() and before any client/sqlite init.
+// If you see this line but nothing after, the hang is inside main() (likely sqlite lock).
+// If you DON'T see this line, tsx itself is hanging during import resolution.
+process.stdout.write(`[${new Date().toISOString()}] [bot] Script loaded — entering main()\n`);
+
 main().catch((err: unknown) => {
   console.error("[bot] Fatal:", err);
   process.exit(1);

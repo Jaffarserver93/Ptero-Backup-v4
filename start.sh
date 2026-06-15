@@ -190,4 +190,19 @@ echo -e "  ${YELLOW}After login the session is saved — no OTP on restart.${NC}
 echo ""
 
 cd "$(dirname "${BASH_SOURCE[0]}")"
+
+# Kill any stale backup-bot processes that might be holding the SQLite session lock.
+# A previous run that was flood-waited or killed mid-cycle can leave a process sleeping
+# with an exclusive lock on .telegram_session.db, which causes the new process to hang
+# silently before printing any output (better-sqlite3 is synchronous — its lock-wait
+# blocks the entire Node.js thread).
+STALE_PIDS=$(pgrep -f "tsx.*backup-bot" 2>/dev/null || true)
+if [ -n "$STALE_PIDS" ]; then
+  echo -e "  ${YELLOW}⚠ Found stale backup-bot process(es) — terminating before restart...${NC}"
+  echo "$STALE_PIDS" | xargs kill 2>/dev/null || true
+  sleep 1
+  echo -e "  ${GREEN}✓ Stale process(es) cleared${NC}"
+  echo ""
+fi
+
 exec pnpm --filter @workspace/scripts run backup-bot
