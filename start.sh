@@ -90,14 +90,20 @@ else
   if [ ! -f "$BINDING" ]; then
     # No prebuilt binary available — compile from source
     echo -e "${YELLOW}  No prebuilt binary found — compiling from source...${NC}"
-    if ! command -v node-gyp &>/dev/null; then
-      echo -e "${RED}  ✗ node-gyp not found. Fix with:${NC}"
-      echo -e "${RED}      npm install -g node-gyp${NC}"
-      echo -e "${RED}  If that fails, also run: apt-get install -y python3 make g++${NC}"
+    # Check all build tools are present before starting (avoids silent hang)
+    MISSING=""
+    command -v make      &>/dev/null || MISSING="$MISSING make"
+    command -v g++       &>/dev/null || MISSING="$MISSING g++"
+    command -v python3   &>/dev/null || MISSING="$MISSING python3"
+    command -v node-gyp  &>/dev/null || MISSING="$MISSING node-gyp(run:npm install -g node-gyp)"
+    if [ -n "$MISSING" ]; then
+      echo -e "${RED}  ✗ Missing build tools:${MISSING}${NC}"
+      echo -e "${RED}  Run: apt-get install -y make g++ python3${NC}"
       exit 1
     fi
-    if ! (cd "$BSQ3" && node-gyp rebuild --release 2>&1 | tail -10); then
-      echo -e "${RED}  ✗ Compile failed. Run: apt-get install -y python3 make g++${NC}"
+    echo -e "${YELLOW}  Compiling (this takes ~30-60s)...${NC}"
+    if ! (cd "$BSQ3" && node-gyp rebuild --release 2>&1); then
+      echo -e "${RED}  ✗ Compile failed.${NC}"
       exit 1
     fi
   fi
