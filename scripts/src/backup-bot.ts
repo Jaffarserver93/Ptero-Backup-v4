@@ -252,8 +252,26 @@ async function main(): Promise<void> {
       // 1. Compress worlds + plugins into one archive on the panel
       const archiveName = await compressFolders();
 
-      // 2. Get download URL and pull it to temp storage here
-      const downloadUrl = await getDownloadLink(archiveName);
+      // Wait for Wings to finish writing the archive before requesting download
+      log("ptero", "Waiting 5s for archive to be ready on Wings...");
+      await sleep(5_000);
+
+      // 2. Get download URL and pull it to temp storage here (retry up to 3x on 500)
+      let downloadUrl = "";
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          downloadUrl = await getDownloadLink(archiveName);
+          break;
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          if (attempt < 3) {
+            log("ptero", `Download link attempt ${attempt} failed (${msg}) — retrying in 10s...`);
+            await sleep(10_000);
+          } else {
+            throw new Error(`Failed to get download link after 3 attempts: ${msg}`);
+          }
+        }
+      }
       await downloadArchive(downloadUrl);
 
       // 3. Upload to Telegram Saved Messages (supports up to 2 GB via MTProto)
