@@ -71,24 +71,41 @@ echo -e "${BOLD}[2/3] Installing packages...${NC}"
 cd "$(dirname "${BASH_SOURCE[0]}")"
 pnpm install 2>&1 | tail -5
 
-echo -e "${YELLOW}  Building better-sqlite3 native module...${NC}"
+echo -e "${YELLOW}  Checking better-sqlite3 native module...${NC}"
 BSQ3=$(ls -d node_modules/.pnpm/better-sqlite3@*/node_modules/better-sqlite3 2>/dev/null | head -1)
 if [ -z "$BSQ3" ]; then
   echo -e "${RED}  ✗ better-sqlite3 not found in node_modules${NC}"
   exit 1
 fi
-# Run prebuild-install (downloads prebuilt binary for this platform/Node version)
-if (cd "$BSQ3" && node_modules/.bin/prebuild-install 2>&1 | tail -5); then
-  echo -e "${GREEN}  ✓ better-sqlite3 native module ready${NC}"
+
+BINDING="$BSQ3/build/Release/better_sqlite3.node"
+
+if [ -f "$BINDING" ]; then
+  echo -e "${GREEN}  ✓ Native module already built${NC}"
 else
-  # Fallback: compile from source with node-gyp
-  echo -e "${YELLOW}  Prebuilt binary not found — compiling from source...${NC}"
-  if command -v node-gyp &>/dev/null; then
-    (cd "$BSQ3" && node-gyp rebuild --release 2>&1 | tail -10) \
-      && echo -e "${GREEN}  ✓ Compiled successfully${NC}" \
-      || { echo -e "${RED}  ✗ Compile failed. Run: apt-get install -y python3 make g++${NC}"; exit 1; }
+  # Try downloading a prebuilt binary first
+  echo -e "${YELLOW}  Downloading prebuilt binary...${NC}"
+  (cd "$BSQ3" && node_modules/.bin/prebuild-install 2>&1 | grep -v "^$") || true
+
+  if [ ! -f "$BINDING" ]; then
+    # No prebuilt binary available — compile from source
+    echo -e "${YELLOW}  No prebuilt binary found — compiling from source...${NC}"
+    if ! command -v node-gyp &>/dev/null; then
+      echo -e "${RED}  ✗ node-gyp not found. Fix with:${NC}"
+      echo -e "${RED}      npm install -g node-gyp${NC}"
+      echo -e "${RED}  If that fails, also run: apt-get install -y python3 make g++${NC}"
+      exit 1
+    fi
+    if ! (cd "$BSQ3" && node-gyp rebuild --release 2>&1 | tail -10); then
+      echo -e "${RED}  ✗ Compile failed. Run: apt-get install -y python3 make g++${NC}"
+      exit 1
+    fi
+  fi
+
+  if [ -f "$BINDING" ]; then
+    echo -e "${GREEN}  ✓ better-sqlite3 built successfully${NC}"
   else
-    echo -e "${RED}  ✗ node-gyp not found. Run: npm install -g node-gyp${NC}"
+    echo -e "${RED}  ✗ Build failed — binding file still missing${NC}"
     exit 1
   fi
 fi
