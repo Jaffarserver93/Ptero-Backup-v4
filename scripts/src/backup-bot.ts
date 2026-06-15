@@ -370,36 +370,66 @@ async function main(): Promise<void> {
       await downloadArchive(downloadUrl);
 
       // 4. Upload to Telegram Saved Messages (supports up to 2 GB via MTProto)
+      //    Retries up to MAX_UPLOAD_ATTEMPTS times, respecting FLOOD_PREMIUM_WAIT
+      //    between attempts. The temp file is kept alive across retries so we never
+      //    have to re-download the archive from the panel.
       const fileSize = fs.statSync(TMP_ARCHIVE).size;
       const sizeMB = (fileSize / 1024 / 1024).toFixed(2);
       const ts = new Date().toISOString();
       const fileName = `backup_${ts.replace(/[:.]/g, "-").replace("T", "_").slice(0, 19)}.tar.gz`;
 
-      log("telegram", `Uploading ${sizeMB} MB to Saved Messages...`);
-      const uploadStart = Date.now();
+      const MAX_UPLOAD_ATTEMPTS = 5;
+      let sentMsg: Awaited<ReturnType<typeof client.sendMedia>> | null = null;
 
-      let lastLoggedPct = -1;
-      const uploaded = await client.uploadFile({
-        file: TMP_ARCHIVE,
-        fileName,
-        requestsPerConnection: 1, // keep to 1 — Telegram throttles non-Premium burst uploads
-        progressCallback: (done, total) => {
-          const pct = Math.floor((done / total) * 100);
-          if (pct >= lastLoggedPct + 10) {
-            lastLoggedPct = pct;
-            const elapsed = ((Date.now() - uploadStart) / 1000).toFixed(0);
-            log("telegram", `  Uploading... ${pct}% (${(done / 1024 / 1024).toFixed(1)} / ${(total / 1024 / 1024).toFixed(1)} MB) [${elapsed}s]`);
+      for (let attempt = 1; attempt <= MAX_UPLOAD_ATTEMPTS; attempt++) {
+        try {
+          log("telegram", `Uploading ${sizeMB} MB to Saved Messages... (attempt ${attempt}/${MAX_UPLOAD_ATTEMPTS})`);
+          const uploadStart = Date.now();
+
+          let lastLoggedPct = -1;
+          const uploaded = await client.uploadFile({
+            file: TMP_ARCHIVE,
+            fileName,
+            // 1 request in flight at a time + small 128 KB parts = the most
+            // conservative upload mode available to avoid FLOOD_PREMIUM_WAIT
+            // for non-Premium accounts uploading large files.
+            requestsPerConnection: 1,
+            partSize: 128,
+            progressCallback: (done, total) => {
+              const pct = Math.floor((done / total) * 100);
+              if (pct >= lastLoggedPct + 10) {
+                lastLoggedPct = pct;
+                const elapsed = ((Date.now() - uploadStart) / 1000).toFixed(0);
+                log("telegram", `  Uploading... ${pct}% (${(done / 1024 / 1024).toFixed(1)} / ${(total / 1024 / 1024).toFixed(1)} MB) [${elapsed}s]`);
+              }
+            },
+          });
+
+          sentMsg = await client.sendMedia("me", {
+            type: "document",
+            file: uploaded,
+            fileName,
+            caption: `🗄 *Pterodactyl Backup*\n📅 ${ts}\n💾 ${sizeMB} MB\n📦 ${folders.join(" + ")}`,
+          });
+          log("telegram", `✓ Upload + send done in ${((Date.now() - uploadStart) / 1000).toFixed(1)}s — msg ID ${sentMsg.id}`);
+          break; // success — exit retry loop
+
+        } catch (uploadErr) {
+          const floodSecs = parseFloodWaitSecs(uploadErr);
+          if (floodSecs !== null && attempt < MAX_UPLOAD_ATTEMPTS) {
+            // Telegram flood-wait: pause for the required duration + a safety buffer,
+            // then retry without re-downloading the archive.
+            const waitSecs = floodSecs + 15;
+            log("telegram", `FLOOD_PREMIUM_WAIT ${floodSecs}s on attempt ${attempt} — waiting ${waitSecs}s before retry...`);
+            await sleep(waitSecs * 1_000);
+            continue;
           }
-        },
-      });
+          // Non-flood error, or flood on the final attempt — propagate to cycle handler
+          throw uploadErr;
+        }
+      }
 
-      const sentMsg = await client.sendMedia("me", {
-        type: "document",
-        file: uploaded,
-        fileName,
-        caption: `🗄 *Pterodactyl Backup*\n📅 ${ts}\n💾 ${sizeMB} MB\n📦 ${folders.join(" + ")}`,
-      });
-      log("telegram", `✓ Upload + send done in ${((Date.now() - uploadStart) / 1000).toFixed(1)}s — msg ID ${sentMsg.id}`);
+      if (!sentMsg) throw new Error("Upload loop exited without sending a message");
 
       // 5. Delete the previous backup from Saved Messages (keep exactly 1)
       if (state.previousTelegramMsgId) {
