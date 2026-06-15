@@ -93,6 +93,27 @@ async function ensureBackupDir(): Promise<void> {
   }
 }
 
+async function cleanupOrphanedArchives(): Promise<void> {
+  // Delete any leftover archive-*.tar.gz files in the server root from failed previous cycles
+  try {
+    const res = await ptero.get(`/servers/${SERVER_ID}/files/list?directory=/`);
+    const files: Array<{ attributes: { name: string; is_file: boolean } }> =
+      res.data?.data ?? [];
+    const orphans = files
+      .filter(f => f.attributes.is_file && /^archive-.+\.tar\.gz$/.test(f.attributes.name))
+      .map(f => f.attributes.name);
+    if (orphans.length > 0) {
+      log("ptero", `Cleaning up ${orphans.length} orphaned archive(s) in root: ${orphans.join(", ")}`);
+      await ptero.post(`/servers/${SERVER_ID}/files/delete`, {
+        root: "/",
+        files: orphans,
+      });
+    }
+  } catch (err) {
+    log("ptero", `Could not clean up orphaned archives: ${String(err)}`);
+  }
+}
+
 async function compressFolders(): Promise<string> {
   const timestamp = new Date()
     .toISOString()
@@ -103,21 +124,32 @@ async function compressFolders(): Promise<string> {
 
   log("ptero", `Compressing ${FOLDERS.join(" + ")} into ${archiveName}...`);
 
-  // Compress both folders together into one archive
-  await ptero.post(`/servers/${SERVER_ID}/files/compress`, {
+  // Compress both folders — the API response contains the actual filename it created
+  const compressRes = await ptero.post(`/servers/${SERVER_ID}/files/compress`, {
     root: "/",
     files: FOLDERS,
   });
 
-  // The panel names it after the first folder or a combined name — rename it
-  // The panel creates <first_folder>.tar.gz when multiple files are compressed
-  const srcName = `${FOLDERS[0]}.tar.gz`;
-  const destPath = `backups/${archiveName}`;
+  // Read the real filename from the API response (Pterodactyl names it archive-<ISO>.tar.gz)
+  const createdName: string =
+    compressRes.data?.attributes?.name ??
+    compressRes.data?.name ??
+    null;
 
-  log("ptero", `Moving ${srcName} → /backups/${archiveName}`);
+  if (!createdName) {
+    throw new Error(
+      "Compress API did not return a filename — cannot locate the archive to move it. " +
+      `Response: ${JSON.stringify(compressRes.data)}`
+    );
+  }
+
+  log("ptero", `Panel created archive: ${createdName}`);
+
+  // Move it into /backups with our own name
+  log("ptero", `Moving ${createdName} → /backups/${archiveName}`);
   await ptero.put(`/servers/${SERVER_ID}/files/rename`, {
     root: "/",
-    files: [{ from: srcName, to: destPath }],
+    files: [{ from: createdName, to: `backups/${archiveName}` }],
   });
 
   log("ptero", `Archive ready at /backups/${archiveName}`);
@@ -249,6 +281,9 @@ async function main(): Promise<void> {
     const state = loadState();
 
     try {
+      // 0. Clean up any orphaned archives from previous failed cycles
+      await cleanupOrphanedArchives();
+
       // 1. Compress worlds + plugins into one archive on the panel
       const archiveName = await compressFolders();
 
