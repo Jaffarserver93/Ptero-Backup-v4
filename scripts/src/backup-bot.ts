@@ -279,6 +279,15 @@ async function uploadFileResumable(
     BigInt(Math.floor(Math.random() * 0x7fffffff)) * BigInt(0x100000000) +
     BigInt(Math.floor(Math.random() * 0xffffffff));
 
+  // Telegram's saveBigFilePart allows at most 4000 parts → 4000 × 512 KB = 2 GB max.
+  // Non-Premium accounts are capped at 2 GB anyway, so this is the hard ceiling.
+  if (totalParts > 4000) {
+    throw new Error(
+      `File too large for Telegram (${(fileSize / 1024 / 1024).toFixed(0)} MB). ` +
+      `Maximum supported size is ~2 GB (4000 × 512 KB parts).`,
+    );
+  }
+
   log("telegram", `Resumable upload: ${totalParts} × 512 KB parts (flood waits auto-handled per-part)`);
 
   const fd = await fsp.open(filePath, "r");
