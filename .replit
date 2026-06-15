@@ -32,7 +32,7 @@ args = "pnpm --filter @workspace/scripts run backup-bot"
 outputType = "console"
 
 [agent]
-stack = "PNPM_WORKSPACE"
+stack = "BEST_EFFORT_FALLBACK"
 expertMode = true
 
 [postMerge]

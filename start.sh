@@ -47,7 +47,7 @@ ask() {
 
 # ─── Step 1: Check dependencies ───────────────────────────────────────────────
 
-echo -e "${BOLD}[1/4] Checking dependencies...${NC}"
+echo -e "${BOLD}[1/3] Checking dependencies...${NC}"
 
 if ! command -v node &>/dev/null; then
   echo -e "${RED}✗ Node.js not found. Install it from https://nodejs.org${NC}"
@@ -66,7 +66,7 @@ echo -e "${GREEN}  ✓ Node.js ${NODE_VER}  |  pnpm ${PNPM_VER}${NC}"
 # ─── Step 2: Install packages ─────────────────────────────────────────────────
 
 echo ""
-echo -e "${BOLD}[2/4] Installing packages...${NC}"
+echo -e "${BOLD}[2/3] Installing packages...${NC}"
 
 cd "$(dirname "${BASH_SOURCE[0]}")"
 pnpm install --frozen-lockfile 2>&1 | tail -5
@@ -75,50 +75,40 @@ echo -e "${YELLOW}  Rebuilding native modules (better-sqlite3)...${NC}"
 cd scripts && npm rebuild better-sqlite3 --silent 2>&1 | tail -3 && cd ..
 echo -e "${GREEN}  ✓ All packages installed${NC}"
 
-# ─── Step 3: Collect configuration ───────────────────────────────────────────
+# ─── Step 3: Configuration ────────────────────────────────────────────────────
 
 echo ""
-echo -e "${BOLD}[3/4] Configuration${NC}"
-echo -e "  ${YELLOW}Leave blank to keep existing value shown in [brackets]${NC}"
-echo ""
+echo -e "${BOLD}[3/3] Configuration${NC}"
 
-# Load existing values if .env exists
 if [ -f "$ENV_FILE" ]; then
-  echo -e "  ${GREEN}Found existing .env — using saved values as defaults${NC}"
-  echo ""
+  # .env exists — load it silently and skip all prompts
+  echo -e "  ${GREEN}✓ Found existing .env — loading saved credentials${NC}"
   set -a
   # shellcheck disable=SC1090
   source "$ENV_FILE"
   set +a
-fi
+else
+  # First run — ask for everything
+  echo -e "  ${YELLOW}First run detected — please enter your credentials${NC}"
+  echo ""
 
-# Pterodactyl
-echo -e "${BOLD}── Pterodactyl Panel ──────────────────────────────────────────${NC}"
-ask "Panel URL (e.g. https://panel.example.com)" PTERODACTYL_URL "${PTERODACTYL_URL:-}"
-ask "Client API Key (Account → API Credentials)" PTERODACTYL_API_KEY "${PTERODACTYL_API_KEY:-}" true
-ask "Server ID (short ID from panel URL, e.g. 1a2b3c4d)" PTERODACTYL_SERVER_ID "${PTERODACTYL_SERVER_ID:-}"
+  echo -e "${BOLD}── Pterodactyl Panel ──────────────────────────────────────────${NC}"
+  ask "Panel URL (e.g. https://panel.example.com)" PTERODACTYL_URL ""
+  ask "Client API Key (Account → API Credentials)" PTERODACTYL_API_KEY "" true
+  ask "Server ID (short ID from panel URL, e.g. 1a2b3c4d)" PTERODACTYL_SERVER_ID ""
 
-echo ""
-# Telegram
-echo -e "${BOLD}── Telegram Account ───────────────────────────────────────────${NC}"
-echo -e "  ${YELLOW}Get API_ID and API_HASH from: https://my.telegram.org → App API${NC}"
-ask "API ID (numbers only)" TELEGRAM_API_ID "${TELEGRAM_API_ID:-}"
-ask "API Hash" TELEGRAM_API_HASH "${TELEGRAM_API_HASH:-}" true
-ask "Phone number (with country code, e.g. +1234567890)" TELEGRAM_PHONE "${TELEGRAM_PHONE:-}"
+  echo ""
+  echo -e "${BOLD}── Telegram Account ───────────────────────────────────────────${NC}"
+  echo -e "  ${YELLOW}Get API_ID and API_HASH from: https://my.telegram.org → App API${NC}"
+  ask "API ID (numbers only)" TELEGRAM_API_ID ""
+  ask "API Hash" TELEGRAM_API_HASH "" true
+  ask "Phone number (with country code, e.g. +1234567890)" TELEGRAM_PHONE ""
 
-echo ""
-# Optional session (skip OTP on restart)
-echo -e "${BOLD}── Session (optional) ─────────────────────────────────────────${NC}"
-echo -e "  ${YELLOW}If you have a saved session string, paste it here to skip OTP${NC}"
-echo -e "  ${YELLOW}Leave blank on first run — session will be saved automatically${NC}"
-ask "Session string (leave blank for first run)" TELEGRAM_SESSION "${TELEGRAM_SESSION:-}"
+  # Write .env
+  echo ""
+  echo -e "  Saving credentials to ${ENV_FILE}..."
 
-# ─── Step 4: Write .env ───────────────────────────────────────────────────────
-
-echo ""
-echo -e "${BOLD}[4/4] Saving configuration to ${ENV_FILE}...${NC}"
-
-cat > "$ENV_FILE" <<EOF
+  cat > "$ENV_FILE" <<EOF
 # ── Pterodactyl ─────────────────────────────────────────────────────────
 PTERODACTYL_URL=${PTERODACTYL_URL}
 PTERODACTYL_API_KEY=${PTERODACTYL_API_KEY}
@@ -128,24 +118,21 @@ PTERODACTYL_SERVER_ID=${PTERODACTYL_SERVER_ID}
 TELEGRAM_API_ID=${TELEGRAM_API_ID}
 TELEGRAM_API_HASH=${TELEGRAM_API_HASH}
 TELEGRAM_PHONE=${TELEGRAM_PHONE}
-
-# ── Session (auto-filled after first login — do not edit manually) ───────
-TELEGRAM_SESSION=${TELEGRAM_SESSION}
 EOF
 
-echo -e "${GREEN}  ✓ Saved to ${ENV_FILE}${NC}"
+  echo -e "${GREEN}  ✓ Credentials saved — future runs will load automatically${NC}"
+fi
 
 # ─── Launch ───────────────────────────────────────────────────────────────────
 
 echo ""
 echo -e "${BOLD}${GREEN}╔══════════════════════════════════════════════╗${NC}"
-echo -e "${BOLD}${GREEN}║         Setup complete — starting bot        ║${NC}"
+echo -e "${BOLD}${GREEN}║            Starting backup bot...            ║${NC}"
 echo -e "${BOLD}${GREEN}╚══════════════════════════════════════════════╝${NC}"
 echo ""
 echo -e "  ${CYAN}• Backs up: worlds + plugins every 5 minutes${NC}"
 echo -e "  ${CYAN}• Sends to: Telegram Saved Messages (up to 2 GB)${NC}"
 echo -e "  ${CYAN}• Keeps: exactly 1 backup at a time in Saved Messages${NC}"
-echo -e "  ${CYAN}• Upload: 16 parallel connections for max speed${NC}"
 echo ""
 echo -e "  ${YELLOW}First run will ask for your Telegram OTP code.${NC}"
 echo -e "  ${YELLOW}After login the session is saved — no OTP on restart.${NC}"
