@@ -69,10 +69,10 @@ echo ""
 echo -e "${BOLD}[2/3] Installing packages...${NC}"
 
 cd "$(dirname "${BASH_SOURCE[0]}")"
-pnpm install --frozen-lockfile 2>&1 | tail -5
+pnpm install 2>&1 | tail -5
 
 echo -e "${YELLOW}  Rebuilding native modules (better-sqlite3)...${NC}"
-cd scripts && npm rebuild better-sqlite3 --silent 2>&1 | tail -3 && cd ..
+pnpm rebuild better-sqlite3 2>&1 | tail -3
 echo -e "${GREEN}  ✓ All packages installed${NC}"
 
 # ─── Step 3: Configuration ────────────────────────────────────────────────────
