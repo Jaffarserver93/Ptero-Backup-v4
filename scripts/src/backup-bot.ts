@@ -9,8 +9,16 @@ import { setTimeout as sleep } from "timers/promises";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SCRIPTS_ROOT = path.join(__dirname, "..");
 
-// mtcute creates many AbortSignal listeners during parallel uploads — raise the limit
-process.setMaxListeners(50);
+// Suppress AbortSignal MaxListeners warning caused by mtcute's internal parallel connections
+const originalEmit = process.emit.bind(process);
+// @ts-ignore
+process.emit = (event: string, ...args: unknown[]) => {
+  if (event === "warning") {
+    const w = args[0] as { name?: string; message?: string };
+    if (w?.name === "MaxListenersExceededWarning") return false;
+  }
+  return originalEmit(event, ...args);
+};
 
 // ─── Load .env file if present (for terminal / start.sh runs) ─────────────────
 try {
@@ -374,7 +382,7 @@ async function main(): Promise<void> {
       const uploaded = await client.uploadFile({
         file: TMP_ARCHIVE,
         fileName,
-        requestsPerConnection: 16,
+        requestsPerConnection: 1, // keep to 1 — Telegram throttles non-Premium burst uploads
         progressCallback: (done, total) => {
           const pct = Math.floor((done / total) * 100);
           if (pct >= lastLoggedPct + 10) {
