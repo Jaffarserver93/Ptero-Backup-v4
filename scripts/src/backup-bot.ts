@@ -9,6 +9,21 @@ import { setTimeout as sleep } from "timers/promises";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SCRIPTS_ROOT = path.join(__dirname, "..");
 
+// ─── Load .env file if present (for terminal / start.sh runs) ─────────────────
+try {
+  const envPath = path.join(SCRIPTS_ROOT, ".env");
+  const lines = fs.readFileSync(envPath, "utf8").split("\n");
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const eq = trimmed.indexOf("=");
+    if (eq === -1) continue;
+    const key = trimmed.slice(0, eq).trim();
+    const val = trimmed.slice(eq + 1).trim().replace(/^["']|["']$/g, "");
+    if (key && !process.env[key]) process.env[key] = val;
+  }
+} catch { /* no .env file, fall back to system environment */ }
+
 // ─── Config ───────────────────────────────────────────────────────────────────
 
 const PTERO_URL = process.env["PTERODACTYL_URL"]?.replace(/\/$/, "");
@@ -255,6 +270,7 @@ async function main(): Promise<void> {
       const uploaded = await client.uploadFile({
         file: TMP_ARCHIVE,
         fileName,
+        requestsPerConnection: 16,
         progressCallback: (done, total) => {
           const pct = Math.floor((done / total) * 100);
           // Log every 10%
