@@ -140,6 +140,12 @@ else
   ask "Server ID (short ID from panel URL, e.g. 1a2b3c4d)" PTERODACTYL_SERVER_ID ""
 
   echo ""
+  echo -e "${BOLD}── Folders to back up ─────────────────────────────────────────${NC}"
+  echo -e "  ${YELLOW}Comma-separated folder names at the root of your server${NC}"
+  echo -e "  ${YELLOW}e.g. for Minecraft: world,world_nether,world_the_end,plugins${NC}"
+  ask "Folders to compress" BACKUP_FOLDERS "worlds,plugins"
+
+  echo ""
   echo -e "${BOLD}── Telegram Account ───────────────────────────────────────────${NC}"
   echo -e "  ${YELLOW}Get API_ID and API_HASH from: https://my.telegram.org → App API${NC}"
   ask "API ID (numbers only)" TELEGRAM_API_ID ""
@@ -155,6 +161,9 @@ else
 PTERODACTYL_URL=${PTERODACTYL_URL}
 PTERODACTYL_API_KEY=${PTERODACTYL_API_KEY}
 PTERODACTYL_SERVER_ID=${PTERODACTYL_SERVER_ID}
+
+# ── Folders to back up (comma-separated, must match server root exactly) ─
+BACKUP_FOLDERS=${BACKUP_FOLDERS}
 
 # ── Telegram (MTProto user account) ─────────────────────────────────────
 TELEGRAM_API_ID=${TELEGRAM_API_ID}

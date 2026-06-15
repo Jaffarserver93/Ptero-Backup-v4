@@ -40,9 +40,14 @@ if (!TG_API_ID) throw new Error("TELEGRAM_API_ID is required");
 if (!TG_API_HASH) throw new Error("TELEGRAM_API_HASH is required");
 if (!TG_PHONE) throw new Error("TELEGRAM_PHONE is required");
 
+// Comma-separated folder names to back up — override via BACKUP_FOLDERS in .env
+// e.g. BACKUP_FOLDERS=world,world_nether,world_the_end,plugins
+const CONFIGURED_FOLDERS = (process.env["BACKUP_FOLDERS"] ?? "worlds,plugins")
+  .split(",")
+  .map(f => f.trim())
+  .filter(Boolean);
+
 const INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
-const FOLDERS = ["worlds", "plugins"];
-const BACKUP_ZIP_NAME = "worlds_plugins_backup.zip";
 const TMP_ARCHIVE = "/tmp/ptero_backup.tar.gz";
 const SESSION_DB = path.join(SCRIPTS_ROOT, ".telegram_session.db");
 const STATE_FILE = path.join(SCRIPTS_ROOT, ".bot_state.json");
@@ -94,7 +99,7 @@ async function ensureBackupDir(): Promise<void> {
 }
 
 async function cleanupOrphanedArchives(): Promise<void> {
-  // Delete any leftover archive-*.tar.gz files in the server root from failed previous cycles
+  // Delete leftover archive-*.tar.gz files in root from failed previous cycles
   try {
     const res = await ptero.get(`/servers/${SERVER_ID}/files/list?directory=/`);
     const files: Array<{ attributes: { name: string; is_file: boolean } }> =
@@ -103,18 +108,52 @@ async function cleanupOrphanedArchives(): Promise<void> {
       .filter(f => f.attributes.is_file && /^archive-.+\.tar\.gz$/.test(f.attributes.name))
       .map(f => f.attributes.name);
     if (orphans.length > 0) {
-      log("ptero", `Cleaning up ${orphans.length} orphaned archive(s) in root: ${orphans.join(", ")}`);
-      await ptero.post(`/servers/${SERVER_ID}/files/delete`, {
-        root: "/",
-        files: orphans,
-      });
+      log("ptero", `Cleaning up ${orphans.length} orphaned root archive(s): ${orphans.join(", ")}`);
+      await ptero.post(`/servers/${SERVER_ID}/files/delete`, { root: "/", files: orphans });
     }
   } catch (err) {
     log("ptero", `Could not clean up orphaned archives: ${String(err)}`);
   }
 }
 
-async function compressFolders(): Promise<string> {
+async function resolveBackupFolders(): Promise<string[]> {
+  // List root dir and only compress folders that actually exist on the server
+  const res = await ptero.get(`/servers/${SERVER_ID}/files/list?directory=/`);
+  const entries: Array<{ attributes: { name: string; is_file: boolean } }> =
+    res.data?.data ?? [];
+  const existingNames = new Set(
+    entries.filter(e => !e.attributes.is_file).map(e => e.attributes.name)
+  );
+
+  const found: string[] = [];
+  const missing: string[] = [];
+  for (const folder of CONFIGURED_FOLDERS) {
+    if (existingNames.has(folder)) {
+      found.push(folder);
+    } else {
+      missing.push(folder);
+    }
+  }
+
+  if (missing.length > 0) {
+    log("ptero", `WARNING: configured folder(s) not found on server: ${missing.join(", ")}`);
+    log("ptero", `  → Available directories: ${[...existingNames].sort().join(", ")}`);
+    log("ptero", `  → To fix: add BACKUP_FOLDERS=<comma list> to scripts/.env`);
+  }
+
+  if (found.length === 0) {
+    throw new Error(
+      `None of the configured folders exist on the server: ${CONFIGURED_FOLDERS.join(", ")}. ` +
+      `Available: ${[...existingNames].sort().join(", ")}. ` +
+      `Set BACKUP_FOLDERS in scripts/.env.`
+    );
+  }
+
+  log("ptero", `Folders to compress: ${found.join(", ")}`);
+  return found;
+}
+
+async function compressFolders(folders: string[]): Promise<string> {
   const timestamp = new Date()
     .toISOString()
     .replace(/[:.]/g, "-")
@@ -122,15 +161,15 @@ async function compressFolders(): Promise<string> {
     .slice(0, 19);
   const archiveName = `backup_${timestamp}.tar.gz`;
 
-  log("ptero", `Compressing ${FOLDERS.join(" + ")} into ${archiveName}...`);
+  log("ptero", `Compressing ${folders.join(" + ")} → ${archiveName}...`);
 
-  // Compress both folders — the API response contains the actual filename it created
+  // Compress — the API response contains the actual filename the panel created
   const compressRes = await ptero.post(`/servers/${SERVER_ID}/files/compress`, {
     root: "/",
-    files: FOLDERS,
+    files: folders,
   });
 
-  // Read the real filename from the API response (Pterodactyl names it archive-<ISO>.tar.gz)
+  // Read the real filename from the response (Pterodactyl names it archive-<ISO>.tar.gz)
   const createdName: string =
     compressRes.data?.attributes?.name ??
     compressRes.data?.name ??
@@ -138,14 +177,12 @@ async function compressFolders(): Promise<string> {
 
   if (!createdName) {
     throw new Error(
-      "Compress API did not return a filename — cannot locate the archive to move it. " +
+      "Compress API did not return a filename. " +
       `Response: ${JSON.stringify(compressRes.data)}`
     );
   }
 
   log("ptero", `Panel created archive: ${createdName}`);
-
-  // Move it into /backups with our own name
   log("ptero", `Moving ${createdName} → /backups/${archiveName}`);
   await ptero.put(`/servers/${SERVER_ID}/files/rename`, {
     root: "/",
@@ -157,7 +194,6 @@ async function compressFolders(): Promise<string> {
 }
 
 async function getDownloadLink(archiveName: string): Promise<string> {
-  // Get a signed download URL for the file
   const res = await ptero.get(
     `/servers/${SERVER_ID}/files/download?file=/backups/${archiveName}`
   );
@@ -228,10 +264,20 @@ async function readFromStdin(prompt: string): Promise<string> {
   });
 }
 
+// ─── Error helpers ────────────────────────────────────────────────────────────
+
+function parseFloodWaitSecs(err: unknown): number | null {
+  const msg = err instanceof Error ? err.message : String(err);
+  // Matches FLOOD_WAIT_42, FLOOD_PREMIUM_WAIT5, FLOOD_PREMIUM_WAIT_5, etc.
+  const m = msg.match(/FLOOD_(?:PREMIUM_)?WAIT_?(\d+)/i);
+  return m ? parseInt(m[1], 10) : null;
+}
+
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 async function main(): Promise<void> {
   log("bot", "Pterodactyl → Telegram backup bot starting...");
+  log("bot", `Configured folders: ${CONFIGURED_FOLDERS.join(", ")}`);
 
   const client = new TelegramClient({
     apiId: parseInt(TG_API_ID!),
@@ -254,10 +300,9 @@ async function main(): Promise<void> {
 
   log("telegram", "Logged in successfully — session saved to .telegram_session.db");
 
-  // Send a startup notice to Saved Messages then auto-delete it
   try {
-    const startMsg = await client.sendText("me", 
-      `🟢 *Backup Bot Online*\n📅 ${new Date().toISOString()}\n⏱ Backing up: worlds + plugins every 5 min`
+    const startMsg = await client.sendText("me",
+      `🟢 *Backup Bot Online*\n📅 ${new Date().toISOString()}\n⏱ Backing up: ${CONFIGURED_FOLDERS.join(" + ")} every 5 min`
     );
     log("telegram", "Startup message sent to Saved Messages (auto-deletes in 30s)");
     sleep(30_000).then(async () => {
@@ -279,19 +324,23 @@ async function main(): Promise<void> {
   while (true) {
     const cycleStart = Date.now();
     const state = loadState();
+    let archiveName: string | null = null;
 
     try {
-      // 0. Clean up any orphaned archives from previous failed cycles
+      // 0. Clean up orphaned archives in root from previous failed cycles
       await cleanupOrphanedArchives();
 
-      // 1. Compress worlds + plugins into one archive on the panel
-      const archiveName = await compressFolders();
+      // 1. Verify which configured folders actually exist on the server
+      const folders = await resolveBackupFolders();
 
-      // Wait for Wings to finish writing the archive before requesting download
+      // 2. Compress the verified folders into one archive
+      archiveName = await compressFolders(folders);
+
+      // Wait for Wings to finish writing before requesting a download link
       log("ptero", "Waiting 5s for archive to be ready on Wings...");
       await sleep(5_000);
 
-      // 2. Get download URL and pull it to temp storage here (retry up to 3x on 500)
+      // 3. Get download URL — retry up to 3× on 500
       let downloadUrl = "";
       for (let attempt = 1; attempt <= 3; attempt++) {
         try {
@@ -309,16 +358,15 @@ async function main(): Promise<void> {
       }
       await downloadArchive(downloadUrl);
 
-      // 3. Upload to Telegram Saved Messages (supports up to 2 GB via MTProto)
+      // 4. Upload to Telegram Saved Messages (supports up to 2 GB via MTProto)
       const fileSize = fs.statSync(TMP_ARCHIVE).size;
       const sizeMB = (fileSize / 1024 / 1024).toFixed(2);
       const ts = new Date().toISOString();
-      const fileName = `worlds_plugins_${ts.replace(/[:.]/g, "-").replace("T", "_").slice(0, 19)}.tar.gz`;
+      const fileName = `backup_${ts.replace(/[:.]/g, "-").replace("T", "_").slice(0, 19)}.tar.gz`;
 
       log("telegram", `Uploading ${sizeMB} MB to Saved Messages...`);
       const uploadStart = Date.now();
 
-      // Upload the file with live progress logging
       let lastLoggedPct = -1;
       const uploaded = await client.uploadFile({
         file: TMP_ARCHIVE,
@@ -326,7 +374,6 @@ async function main(): Promise<void> {
         requestsPerConnection: 16,
         progressCallback: (done, total) => {
           const pct = Math.floor((done / total) * 100);
-          // Log every 10%
           if (pct >= lastLoggedPct + 10) {
             lastLoggedPct = pct;
             const elapsed = ((Date.now() - uploadStart) / 1000).toFixed(0);
@@ -335,17 +382,15 @@ async function main(): Promise<void> {
         },
       });
 
-      // Send the already-uploaded file to Saved Messages
       const sentMsg = await client.sendMedia("me", {
         type: "document",
         file: uploaded,
         fileName,
-        caption: `🗄 *Pterodactyl Backup*\n📅 ${ts}\n💾 ${sizeMB} MB\n📦 worlds + plugins`,
+        caption: `🗄 *Pterodactyl Backup*\n📅 ${ts}\n💾 ${sizeMB} MB\n📦 ${folders.join(" + ")}`,
       });
       log("telegram", `✓ Upload + send done in ${((Date.now() - uploadStart) / 1000).toFixed(1)}s — msg ID ${sentMsg.id}`);
 
-      // 4. New backup is safely in Saved Messages — NOW delete the previous one
-      //    This ensures there is always exactly 1 backup in Saved Messages
+      // 5. Delete the previous backup from Saved Messages (keep exactly 1)
       if (state.previousTelegramMsgId) {
         try {
           await client.deleteMessagesById("me", [state.previousTelegramMsgId]);
@@ -355,13 +400,14 @@ async function main(): Promise<void> {
         }
       }
 
-      // 5. Delete the archive from the panel server
+      // 6. Delete the archive from the panel
       await deleteArchiveFromServer(archiveName);
+      archiveName = null; // mark cleaned up
 
-      // 6. Clean up local temp file
+      // 7. Clean up local temp file
       await fsp.rm(TMP_ARCHIVE, { force: true });
 
-      // 7. Save state for next cycle
+      // 8. Save state
       saveState({ previousTelegramMsgId: sentMsg.id });
 
       const elapsed = Date.now() - cycleStart;
@@ -372,8 +418,29 @@ async function main(): Promise<void> {
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       log("bot", `✗ Cycle error: ${msg}`);
-      // Short retry wait on error
-      await sleep(30_000);
+
+      // Clean up the archive from /backups if it was already moved there
+      if (archiveName) {
+        try {
+          await deleteArchiveFromServer(archiveName);
+          log("ptero", `Cleaned up failed-cycle archive: ${archiveName}`);
+        } catch { /* ignore cleanup errors */ }
+        await fsp.rm(TMP_ARCHIVE, { force: true }).catch(() => {});
+      }
+
+      // Respect Telegram flood-wait — parse the required wait from the error
+      const floodSecs = parseFloodWaitSecs(err);
+      if (floodSecs !== null) {
+        const waitSec = floodSecs + 10; // add a small buffer
+        log("telegram", `Flood wait — sleeping ${waitSec}s before next cycle`);
+        await sleep(waitSec * 1_000);
+      } else {
+        // Default: wait out the rest of the 5-minute interval before retrying
+        const elapsed = Date.now() - cycleStart;
+        const waitMs = Math.max(30_000, INTERVAL_MS - elapsed);
+        log("bot", `Retrying in ${Math.ceil(waitMs / 1000)}s`);
+        await sleep(waitMs);
+      }
     }
   }
 }
