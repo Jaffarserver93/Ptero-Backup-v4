@@ -71,9 +71,28 @@ echo -e "${BOLD}[2/3] Installing packages...${NC}"
 cd "$(dirname "${BASH_SOURCE[0]}")"
 pnpm install 2>&1 | tail -5
 
-echo -e "${YELLOW}  Rebuilding native modules (better-sqlite3)...${NC}"
-pnpm rebuild better-sqlite3 2>&1 | tail -3
-echo -e "${GREEN}  ✓ All packages installed${NC}"
+echo -e "${YELLOW}  Building better-sqlite3 native module...${NC}"
+BSQ3=$(ls -d node_modules/.pnpm/better-sqlite3@*/node_modules/better-sqlite3 2>/dev/null | head -1)
+if [ -z "$BSQ3" ]; then
+  echo -e "${RED}  ✗ better-sqlite3 not found in node_modules${NC}"
+  exit 1
+fi
+# Run prebuild-install (downloads prebuilt binary for this platform/Node version)
+if (cd "$BSQ3" && node_modules/.bin/prebuild-install 2>&1 | tail -5); then
+  echo -e "${GREEN}  ✓ better-sqlite3 native module ready${NC}"
+else
+  # Fallback: compile from source with node-gyp
+  echo -e "${YELLOW}  Prebuilt binary not found — compiling from source...${NC}"
+  if command -v node-gyp &>/dev/null; then
+    (cd "$BSQ3" && node-gyp rebuild --release 2>&1 | tail -10) \
+      && echo -e "${GREEN}  ✓ Compiled successfully${NC}" \
+      || { echo -e "${RED}  ✗ Compile failed. Run: apt-get install -y python3 make g++${NC}"; exit 1; }
+  else
+    echo -e "${RED}  ✗ node-gyp not found. Run: npm install -g node-gyp${NC}"
+    exit 1
+  fi
+fi
+echo -e "${GREEN}  ✓ All packages ready${NC}"
 
 # ─── Step 3: Configuration ────────────────────────────────────────────────────
 
